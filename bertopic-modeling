@@ -1,1 +1,294 @@
+import os
+# 【关键】国内镜像，解决模型下载失败
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# 延长模型下载超时时间
+os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "600"
 
+import pandas as pd
+import numpy as np
+import re
+from bertopic import BERTopic
+from sentence_transformers import SentenceTransformer
+from umap import UMAP
+import matplotlib.pyplot as plt
+import plotly.express as px
+import plotly.graph_objects as go
+from scipy.cluster.hierarchy import dendrogram, linkage
+from sklearn.metrics.pairwise import cosine_distances
+
+# ---------------------- 1. 自定义停用词表（适配LLM大模型领域） ----------------------
+# 通用英文基础停用词
+basic_stop_words = {
+    'the', 'a', 'an', 'and', 'or', 'but', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+    'in', 'on', 'at', 'to', 'for', 'with', 'by', 'from', 'about', 'against', 'between', 'among',
+    'as', 'if', 'when', 'while', 'where', 'why', 'how', 'so', 'too', 'very', 'just', 'only',
+    'this', 'that', 'these', 'those', 'it', 'he', 'she', 'we', 'they', 'i', 'you', 'me', 'him',
+    'her', 'us', 'them', 'my', 'your', 'his', 'its', 'our', 'their', 'am', 'have', 'has', 'had',
+    'do', 'does', 'did', 'will', 'would', 'shall', 'should', 'may', 'might', 'can', 'could',
+    'must', 'need', 'ought', 'there', 'here', 'now', 'then', 'today', 'tomorrow', 'yesterday',
+    'all', 'some', 'any', 'no', 'each', 'every', 'both', 'either', 'neither', 'one', 'two',
+    'three', 'four', 'five', 'many', 'much', 'more', 'most', 'less', 'least', 'few', 'fewer',
+    'little', 'lesser', 'other', 'another', 'such', 'same', 'like', 'unlike', 'than', 'as', 'so', 'which'
+}
+
+# 通用学术停用词（所有论文通用无意义词汇）
+academic_stop_words = {
+    'study', 'studies', 'result', 'results', 'research', 'paper', 'analysis', 'analyses',
+    'method', 'methods', 'experiment', 'experiments', 'data', 'dataset', 'datasets',
+    'model', 'models', 'approach', 'approaches', 'application', 'applications', 'use', 'uses',
+    'based', 'using', 'used', 'propose', 'proposed', 'present', 'presented', 'show', 'shows',
+    'demonstrate', 'demonstrates', 'indicate', 'indicates', 'suggest', 'suggests', 'find', 'finds',
+    'conclude', 'concludes', 'conclusion', 'conclusions', 'discussion', 'discussions', 'section',
+    'sections', 'chapter', 'chapters', 'introduction', 'background', 'literature', 'review',
+    'case', 'cases', 'example', 'examples', 'sample', 'samples', 'test', 'tests', 'trial', 'trials'
+}
+
+# LLM大模型领域通用停用词（过滤行业通用词，提升聚类细分度）
+llm_stop_words = {
+    'battery', 'batteries', 'cell', 'cells', 'materials', 'development',
+    'electrochemical', 'electrolyte', 'electrolytes', 'electrode',
+    'anode', 'cathode', 'lithium', 'li', 'ion', 'ions', 'solid',
+    'state', 'liquid', 'polymer', 'aqueous', 'non', 'aqueous', 'solvent',
+    'salt', 'salts', 'additive', 'additives', 'interphase', 'sei', 'cei',
+    'voltage', 'current', 'density', 'capacity', 'cycling', 'efficiency'
+}
+
+# 合并所有停用词
+custom_stop_words = basic_stop_words.union(academic_stop_words).union(llm_stop_words)
+print(f"LLM领域自定义停用词表构建完成，共包含 {len(custom_stop_words)} 个停用词")
+
+# ---------------------- 2. 文本预处理函数（适配LLM论文） ----------------------
+def preprocess_combined_text(title, abstract):
+    # 合并论文标题+摘要，保留标记区分文本结构
+    combined_text = f"[TITLE] {str(title).strip()} [ABSTRACT] {str(abstract).strip()}"
+    # 统一小写
+    combined_text = combined_text.lower()
+    # 仅保留英文字母、空格、标记符号，过滤标点、数字、特殊符号
+    combined_text = re.sub(r'[^a-zA-Z\s\[\]]', '', combined_text)
+    # 分词过滤无效词汇
+    words = combined_text.split()
+    words = [word for word in words if len(word) >= 3]  # 过滤2字母及以下短词
+    words = [word for word in words if word not in custom_stop_words]  # 过滤停用词
+    words = [word for word in words if word not in ["[Article Title]", "[Abstract]"]]  # 去除结构标记
+    return ' '.join(words) if words else ''
+
+# ---------------------- 3. 数据加载与预处理（适配savedrecs.csv + Article Title/Abstract列） ----------------------
+np.random.seed(42)  # 固定随机种子，结果完全可复现
+# 适配用户指定的CSV文件名：savedrecs.csv，可根据实际路径调整
+csv_file_path = "C:/Users/liuqian/Desktop/AI for electrolyte-review/摘要-0828.csv"
+embedding_save_path = "llm_embeddings_768d.npy"  # 768维高精度向量缓存，避免重复计算
+
+try:
+    # 读取CSV文件
+    df = pd.read_csv(csv_file_path, encoding='gbk')
+    # 适配用户指定的列名：Article Title、Abstract
+    required_columns = ["Article Title", "Abstract"]
+    if not all(col in df.columns for col in required_columns):
+        raise ValueError(f"CSV缺少必要列！需包含 {required_columns}，当前列：{df.columns.tolist()}")
+
+    # 过滤标题、摘要全为空的无效行
+    df_valid = df.dropna(subset=["Article Title", "Abstract"], how="all").reset_index(drop=True)
+    print(f"原始LLM论文数据共 {len(df)} 行，过滤空行后剩余 {len(df_valid)} 行")
+
+    # 批量预处理文本
+    print("正在合并论文标题与摘要，执行LLM文本预处理...")
+    df_valid["combined_text"] = df_valid.apply(
+        lambda row: preprocess_combined_text(row["Article Title"], row["Abstract"]), axis=1
+    )
+
+    # 过滤预处理后过短的无效文本
+    df_valid = df_valid[df_valid["combined_text"].str.len() > 30].reset_index(drop=True)
+    combined_texts = df_valid["combined_text"].tolist()
+    print(f"预处理完成，有效LLM论文数据共 {len(combined_texts)} 条")
+
+    if len(combined_texts) == 0:
+        print("错误：无有效论文数据！")
+        exit(1)
+    print(f"预处理文本示例（第1条，前150字符）：\n{combined_texts[0][:150]}...")
+
+except FileNotFoundError:
+    print(f"错误：找不到文件 {csv_file_path}，请检查文件路径是否正确")
+    exit(1)
+except ValueError as ve:
+    print(f"数据格式错误：{str(ve)}")
+    exit(1)
+except Exception as e:
+    print(f"数据预处理错误：{str(e)}")
+    exit(1)
+
+# ---------------------- 4. 嵌入向量生成（all-mpnet-base-v2 768维高精度模型） ----------------------
+try:
+    embeddings = None
+    # 加载本地缓存向量，避免重复计算
+    if os.path.exists(embedding_save_path):
+        print(f"加载本地768维LLM论文向量：{embedding_save_path}")
+        embeddings = np.load(embedding_save_path)
+        # 校验向量数量与文本匹配，不匹配则重新生成
+        if embeddings.shape[0] != len(combined_texts):
+            print("向量数量与论文数量不匹配，重新生成向量...")
+            embeddings = None
+
+    if embeddings is None:
+        print("加载高精度模型 all-mpnet-base-v2（768维语义向量）...")
+        embedding_model = SentenceTransformer('all-mpnet-base-v2')
+
+        print("批量生成LLM论文语义向量...")
+        embeddings = embedding_model.encode(
+            combined_texts,
+            show_progress_bar=True,
+            convert_to_numpy=True
+        )
+        # 保存向量到本地缓存
+        np.save(embedding_save_path, embeddings)
+        print(f"768维论文向量已保存至：{embedding_save_path}")
+
+    print(f"最终向量矩阵形状：{embeddings.shape} （论文数, 768维）")
+
+except Exception as e:
+    print(f"模型加载/向量生成错误：{str(e)}")
+    exit(1)
+
+# ---------------------- 5. 原生BERTopic聚类（HDBSCAN自动聚类，无KMeans） ----------------------
+# UMAP降维参数（适配论文长文本语义）
+umap_params = {
+    "n_components": 5,
+    "n_neighbors": 10,
+    "min_dist": 0.08,
+    "random_state": 42
+}
+umap_model = UMAP(**umap_params)
+
+# 原生BERTopic配置：自动识别最优主题数，适配LLM论文聚类
+topic_model = BERTopic(
+    embedding_model=None,        # 使用预生成向量，不重复编码
+    umap_model=umap_model,
+    min_topic_size=12,            # 单个主题最少论文数量，避免无效小聚类
+    verbose=True,
+    top_n_words=5,                # 每个主题展示核心关键词数量
+    n_gram_range=(1, 3),          # 支持1-3字词组合关键词（适配专业术语）
+    calculate_probabilities=True  # 计算每篇论文所属主题概率
+)
+
+print("开始训练原生BERTopic模型（LLM论文自动语义聚类）...")
+topics, probabilities = topic_model.fit_transform(combined_texts, embeddings)
+
+# ---------------------- 6. 输出聚类主题结果与核心关键词 ----------------------
+topic_info = topic_model.get_topic_info()
+print("\n===== LLM论文主题聚类结果汇总 =====")
+print(topic_info[["Topic", "Count", "Name"]].to_string(index=False))
+
+print("\n===== 各主题核心关键词 & 权重 =====")
+for topic_id in topic_info["Topic"].tolist():
+    if topic_id != -1:  # 过滤噪声主题
+        topic_count = topic_info[topic_info["Topic"] == topic_id]["Count"].iloc[0]
+        print(f"\n主题 #{topic_id}（包含{topic_count}篇LLM论文）:")
+        # 过滤低权重无效关键词
+        topic_words = [(word, score) for word, score in topic_model.get_topic(topic_id) if score > 0.01]
+        for word, score in topic_words[:8]:
+            print(f"  {word}: {score:.4f}")
+
+# ====================== 聚类质量评估（无gensim，向量余弦距离法） ======================
+print("\n===== 聚类质量量化评估（基于语义向量余弦距离） =====")
+# 1. 计算每个主题中心向量
+topic_center_dict = {}
+valid_topic_ids = [tid for tid in topic_info["Topic"] if tid != -1]
+for tid in valid_topic_ids:
+    # 获取当前主题所有论文下标
+    paper_index = [idx for idx, t_id in enumerate(topics) if t_id == tid]
+    # 主题中心 = 该主题所有向量均值
+    center_vec = embeddings[paper_index].mean(axis=0)
+    topic_center_dict[tid] = center_vec
+
+# 2. 计算【主题内部平均余弦距离】：数值越小，同一主题论文越紧凑
+inner_distance_list = []
+for tid, center in topic_center_dict.items():
+    paper_index = [idx for idx, t_id in enumerate(topics) if t_id == tid]
+    dist_matrix = cosine_distances(embeddings[paper_index], center.reshape(1, -1))
+    avg_inner_dist = dist_matrix.mean()
+    inner_distance_list.append(avg_inner_dist)
+    print(f"主题{tid} 内部平均余弦距离：{avg_inner_dist:.4f}")
+
+avg_all_inner = np.mean(inner_distance_list)
+print(f"\n全部主题平均内部距离（越小聚类越紧凑）：{avg_all_inner:.4f}")
+
+# 3. 计算【主题之间平均余弦距离】：数值越大，不同主题区分越清晰
+center_array = np.array(list(topic_center_dict.values()))
+inter_dist_matrix = cosine_distances(center_array)
+# 取出上三角，排除自身距离
+upper_triangle = inter_dist_matrix[np.triu_indices_from(inter_dist_matrix, k=1)]
+avg_all_inter = upper_triangle.mean()
+print(f"主题间平均余弦距离（越大区分度越高）：{avg_all_inter:.4f}")
+
+# 4. 综合区分得分 inter / inner，调参对比核心指标，越高越好
+separation_score = avg_all_inter / avg_all_inner
+print(f"综合聚类区分得分 inter/inner（越高聚类效果越好）：{separation_score:.4f}")
+
+# ---------------------- 7. 交互式可视化图表生成 ----------------------
+# 1. 主题相似度距离图
+try:
+    fig1 = topic_model.visualize_topics()
+    fig1.write_html("llm_topic_distance.html")
+    print("\n主题距离相似度图已保存：llm_topic_distance.html")
+except:
+    print("主题距离图生成失败")
+
+# 2. 主题关键词条形图
+try:
+    fig2 = topic_model.visualize_barchart()
+    fig2.write_html("llm_topic_barchart.html")
+    print("主题关键词条形图已保存：llm_topic_barchart.html")
+except:
+    print("主题词条形图生成失败")
+
+# 3. 论文级散点分布图
+try:
+    umap_vis_model = UMAP(n_components=2, **{k: v for k, v in umap_params.items() if k != "n_components"})
+    reduced_embeddings = umap_vis_model.fit_transform(embeddings)
+
+    df_vis = pd.DataFrame({
+        'x': reduced_embeddings[:, 0],
+        'y': reduced_embeddings[:, 1],
+        'topic': topics,
+        'original_title': df_valid["Article Title"].tolist(),
+        'original_abstract': [abs[:100] + '...' if len(str(abs)) > 100 else str(abs) for abs in df_valid["Abstract"].tolist()]
+    })
+
+    fig3 = px.scatter(
+        df_vis, x='x', y='y', color='topic',
+        hover_data=['original_title', 'original_abstract'],
+        title="LLM学术论文语义聚类分布（BERTopic自动聚类）",
+        width=1200, height=800,
+        color_continuous_scale='Spectral'
+    )
+    fig3.update_traces(marker=dict(size=10, sizemin=5, sizemode='area'))
+    fig3.update_layout(paper_bgcolor='white', plot_bgcolor='white')
+    fig3.write_html("llm_paper_distribution.html")
+    print("论文聚类散点图已保存：llm_paper_distribution.html")
+
+except Exception as e:
+    print(f"交互式散点图生成失败：{str(e)}")
+
+# ---------------------- 8. 模型与聚类结果保存 ----------------------
+# 保存训练好的聚类模型
+model_save_path = "llm_bertopic_model"
+topic_model.save(model_save_path)
+print(f"\n训练模型已保存至：{model_save_path}")
+
+# 构建主题映射字典
+topic_name_map = dict(zip(topic_info["Topic"], topic_info["Name"]))
+
+# 构建完整结果数据表
+df_results = pd.DataFrame({
+    "original_index": df_valid.index.tolist(),
+    "article_title": df_valid["Article Title"].tolist(),
+    "abstract": df_valid["Abstract"].tolist(),
+    "preprocessed_text": combined_texts,
+    "topic_id": topics,
+    "topic_name": [topic_name_map[t] for t in topics]
+})
+
+# 输出最终聚类结果CSV
+output_file = "llm_paper_topic_clustering_result.csv"
+df_results.to_csv(output_file, index=False, encoding="utf-8-sig")
+print(f"聚类结果数据表已保存至：{output_file}")
+print("\n✅ LLM论文BERTopic语义聚类全部完成！")
